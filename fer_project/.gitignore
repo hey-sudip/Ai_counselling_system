@@ -1,10 +1,36 @@
+# ----------------------------
+# Python
+# ----------------------------
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
 
-# dataset/raw/
-# dataset/processed/
-
-saved_models/*.pth
-logs/
+# ----------------------------
+# Environment
+# ----------------------------
 .env
+
+# ----------------------------
+# Jupyter
+# ----------------------------
 .ipynb_checkpoints/
+
+# ----------------------------
+# Datasets
+# ----------------------------
+# Raw datasets are stored outside the repository
+dataset/raw/
+
+# Processed dataset generated during preprocessing
+dataset/processed/
+
+# ----------------------------
+# Trained Models
+# ----------------------------
+saved_models/
+*.pth
+
+# ----------------------------
+# Logs
+# ----------------------------
+logs/
