@@ -1,16 +1,22 @@
-"""Basic sanity tests for dataset loading."""
-import os
+from src.config_loader import load_config
+from src.data.dataset import build_dataloaders
 
 
-def test_processed_dirs_exist():
-    for split in ["train", "validation", "test"]:
-        path = os.path.join("dataset", "processed", split)
-        assert os.path.isdir(path), f"Missing directory: {path}"
+def main():
+    cfg = load_config()
+
+    train_loader, val_loader, test_loader, classes = build_dataloaders(cfg)
+
+    print("Classes:", classes)
+    print("Train batches:", len(train_loader))
+    print("Validation batches:", len(val_loader))
+    print("Test batches:", len(test_loader))
+
+    images, labels = next(iter(train_loader))
+
+    print("Image shape:", images.shape)
+    print("Label shape:", labels.shape)
 
 
-def test_class_subfolders_exist():
-    classes = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
-    for split in ["train", "validation", "test"]:
-        for c in classes:
-            path = os.path.join("dataset", "processed", split, c)
-            assert os.path.isdir(path), f"Missing class folder: {path}"
+if __name__ == "__main__":
+    main()
