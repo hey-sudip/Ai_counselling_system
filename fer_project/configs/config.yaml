@@ -24,20 +24,33 @@ model:
 
 training:
   batch_size: 16
-  num_epochs: 30
-  learning_rate: 0.0003
-  weight_decay: 0.00001
+
+  # Give the model more time to converge.
+  num_epochs: 10
+
+  # Classifier/head learning rate.
+  learning_rate: 0.0002
+
+  # Much smaller LR for pretrained EfficientNet backbone.
+  backbone_learning_rate: 0.00001
+
+  weight_decay: 0.00003
+
   optimizer: "adamw"
+
   scheduler: "cosine"
+
+  # Allow several epochs of plateau before stopping.
   early_stopping_patience: 7
+
   num_workers: 4
   device: "cuda"
 
 augmentation:
   horizontal_flip_prob: 0.5
-  rotation_degrees: 10
-  brightness: 0.2
-  contrast: 0.2
+  rotation_degrees: 12
+  brightness: 0.20
+  contrast: 0.20
 
 inference:
   smoothing_window: 8
