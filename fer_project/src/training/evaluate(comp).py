@@ -1,23 +1,31 @@
 """
-Final Evaluation Script for FER2013 Emotion Recognition Model.
+Comparison Evaluation Script for FER2013.
 
-Evaluates the BEST checkpoint on the untouched test set.
+Evaluates the OLD 30-epoch baseline checkpoint
+on the SAME untouched FER2013 test set used for
+the final model evaluation.
 
-Model:
-    EfficientNet-B0
+Purpose:
+    Compare the old baseline model against the new
+    final model fairly using identical test data,
+    preprocessing, class order, and metrics.
+
+Old checkpoint:
+    saved_models/baseline_70_30.pth
 
 Classes:
     angry, disgust, fear, happy, neutral, sad, surprise
 
 Important:
-    - Test set is used ONLY here.
-    - No training or model selection happens here.
-    - Loads emotion_model_best.pth, not emotion_model_last.pth.
+    - Test set is used ONLY for evaluation.
+    - No training is performed.
+    - No model selection is performed.
+    - num_workers=0 is used for Windows compatibility.
 """
 
-import os
-import yaml
+from pathlib import Path
 import torch
+import yaml
 
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms, models
@@ -29,13 +37,27 @@ from sklearn.metrics import (
 
 
 # ============================================================
-# CONFIGURATION
+# PATHS
 # ============================================================
 
-from pathlib import Path
+# Project root:
+# fer_project/
+# ├── configs/
+# ├── dataset/
+# ├── saved_models/
+# └── src/
+#     └── training/
+#         └── evaluate(comp).py
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 CONFIG_PATH = PROJECT_ROOT / "configs" / "config.yaml"
+
+OLD_CHECKPOINT_PATH = (
+    PROJECT_ROOT
+    / "saved_models"
+    / "baseline_70_30.pth"
+)
 
 
 # ============================================================
@@ -67,25 +89,30 @@ else:
 classes = cfg["classes"]
 num_classes = len(classes)
 
+
+# ============================================================
+# DATASET PATH
+# ============================================================
+
+test_dir = PROJECT_ROOT / cfg["paths"]["test_dir"]
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
 print("=" * 70)
-print("FER2013 FINAL MODEL EVALUATION")
+print("FER2013 OLD BASELINE MODEL EVALUATION")
 print("=" * 70)
 
 print(f"\nDevice       : {device}")
 print(f"Classes      : {classes}")
-print(f"Test dataset : {cfg['paths']['test_dir']}")
+print(f"Test dataset : {test_dir}")
+print(f"Checkpoint   : {OLD_CHECKPOINT_PATH}")
 
 
 # ============================================================
 # TEST TRANSFORM
-# ============================================================
-#
-# IMPORTANT:
-# Evaluation must NOT use training augmentation.
-#
-# Only resize + tensor conversion + ImageNet normalization.
-# This matches the standard validation/evaluation pipeline
-# for an ImageNet-pretrained EfficientNet.
 # ============================================================
 
 input_size = cfg["model"]["input_size"]
@@ -105,13 +132,17 @@ test_transform = transforms.Compose([
 # ============================================================
 
 test_dataset = datasets.ImageFolder(
-    root=cfg["paths"]["test_dir"],
+    root=test_dir,
     transform=test_transform
 )
 
 print(f"Test samples : {len(test_dataset)}")
 
-# Verify class order
+
+# ============================================================
+# VERIFY CLASS ORDER
+# ============================================================
+
 if test_dataset.classes != classes:
     raise ValueError(
         "\nClass order mismatch!\n"
@@ -135,6 +166,17 @@ test_loader = DataLoader(
 
 
 # ============================================================
+# CHECKPOINT
+# ============================================================
+
+if not OLD_CHECKPOINT_PATH.exists():
+    raise FileNotFoundError(
+        f"\nOld checkpoint not found:\n"
+        f"{OLD_CHECKPOINT_PATH}"
+    )
+
+
+# ============================================================
 # CREATE MODEL
 # ============================================================
 
@@ -147,12 +189,10 @@ if model_name != "efficientnet_b0":
     )
 
 
-# Create EfficientNet-B0
 model = models.efficientnet_b0(
     weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1
 )
 
-# Replace classifier
 in_features = model.classifier[1].in_features
 
 model.classifier[1] = torch.nn.Linear(
@@ -162,37 +202,15 @@ model.classifier[1] = torch.nn.Linear(
 
 
 # ============================================================
-# LOAD BEST CHECKPOINT
+# LOAD OLD CHECKPOINT
 # ============================================================
 
-checkpoint_path = os.path.join(
-    cfg["paths"]["checkpoint_dir"],
-    "emotion_model_best.pth"
-)
-
-if not os.path.exists(checkpoint_path):
-    raise FileNotFoundError(
-        f"\nBest checkpoint not found:\n{checkpoint_path}"
-    )
-
-
-print(f"\nCheckpoint   : {checkpoint_path}")
+print("\nLoading old baseline checkpoint...")
 
 checkpoint = torch.load(
-    checkpoint_path,
+    OLD_CHECKPOINT_PATH,
     map_location=device
 )
-
-
-# ============================================================
-# HANDLE CHECKPOINT FORMAT
-# ============================================================
-#
-# Supports both:
-#
-# 1. Raw state_dict
-# 2. Dictionary containing "model_state_dict"
-# ============================================================
 
 if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
 
@@ -212,33 +230,34 @@ if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
 
 else:
 
+    # Supports checkpoints that contain only
+    # the model state dictionary.
+
     model.load_state_dict(checkpoint)
 
+    print("Checkpoint format: raw model state_dict")
 
-# Move model to device
+
 model = model.to(device)
-
-# Evaluation mode
 model.eval()
 
 
 # ============================================================
-# LOSS FUNCTION
+# CLASS WEIGHTS
 # ============================================================
+#
+# This is kept identical to the final evaluation script.
 #
 # IMPORTANT:
-# This loss is ONLY used to report test loss.
+# Class weights affect TEST LOSS only.
+# Accuracy, precision, recall, F1 and confusion matrix
+# are calculated directly from predictions and labels.
 #
-# It does NOT affect predictions.
-#
-# We reproduce the training loss:
-# CrossEntropyLoss + class weights + label smoothing.
-#
-# Class weights are calculated from the TRAINING dataset only.
-# ============================================================
+
+train_dir = PROJECT_ROOT / cfg["paths"]["train_dir"]
 
 train_dataset_for_weights = datasets.ImageFolder(
-    root=cfg["paths"]["train_dir"]
+    root=train_dir
 )
 
 train_targets = torch.tensor(
@@ -251,16 +270,12 @@ class_counts = torch.bincount(
     minlength=num_classes
 ).float()
 
-
-# Moderated sqrt inverse-frequency weighting
 class_weights = 1.0 / torch.sqrt(class_counts)
 
-# Normalize weights so average weight = 1
 class_weights = (
     class_weights /
     class_weights.mean()
 )
-
 
 criterion = torch.nn.CrossEntropyLoss(
     weight=class_weights.to(device),
@@ -269,7 +284,7 @@ criterion = torch.nn.CrossEntropyLoss(
 
 
 # ============================================================
-# EVALUATION
+# EVALUATION FUNCTION
 # ============================================================
 
 @torch.no_grad()
@@ -327,20 +342,27 @@ def evaluate(
         total += labels.size(0)
 
         all_preds.extend(
-            preds.cpu().numpy().tolist()
+            preds.cpu()
+            .numpy()
+            .tolist()
         )
 
         all_labels.extend(
-            labels.cpu().numpy().tolist()
+            labels.cpu()
+            .numpy()
+            .tolist()
         )
 
-    # Average loss
+
     avg_loss = running_loss / total
 
-    # Accuracy
     accuracy = correct / total
 
+
+    # --------------------------------------------------------
     # Per-class metrics
+    # --------------------------------------------------------
+
     (
         precision,
         recall,
@@ -354,7 +376,11 @@ def evaluate(
         zero_division=0
     )
 
+
+    # --------------------------------------------------------
     # Macro metrics
+    # --------------------------------------------------------
+
     (
         macro_precision,
         macro_recall,
@@ -368,12 +394,17 @@ def evaluate(
         zero_division=0
     )
 
+
+    # --------------------------------------------------------
     # Confusion matrix
+    # --------------------------------------------------------
+
     cm = confusion_matrix(
         all_labels,
         all_preds,
         labels=list(range(num_classes))
     )
+
 
     return (
         avg_loss,
@@ -390,12 +421,13 @@ def evaluate(
 
 
 # ============================================================
-# RUN EVALUATION
+# RUN TEST EVALUATION
 # ============================================================
 
 print("\n" + "-" * 70)
 print("Running evaluation on TEST SET...")
 print("-" * 70)
+
 
 (
     test_loss,
@@ -418,32 +450,18 @@ print("-" * 70)
 
 
 # ============================================================
-# PRINT OVERALL RESULTS
+# FINAL RESULTS
 # ============================================================
 
 print("\n" + "=" * 70)
-print("FINAL TEST RESULTS")
+print("OLD BASELINE TEST RESULTS")
 print("=" * 70)
 
-print(
-    f"\nTest Loss       : {test_loss:.4f}"
-)
-
-print(
-    f"Test Accuracy   : {test_accuracy * 100:.2f}%"
-)
-
-print(
-    f"Macro Precision : {macro_precision:.4f}"
-)
-
-print(
-    f"Macro Recall    : {macro_recall:.4f}"
-)
-
-print(
-    f"Macro F1        : {macro_f1:.4f}"
-)
+print(f"\nTest Loss       : {test_loss:.4f}")
+print(f"Test Accuracy   : {test_accuracy * 100:.2f}%")
+print(f"Macro Precision : {macro_precision:.4f}")
+print(f"Macro Recall    : {macro_recall:.4f}")
+print(f"Macro F1        : {macro_f1:.4f}")
 
 
 # ============================================================
@@ -463,6 +481,7 @@ print(
 )
 
 print("-" * 60)
+
 
 for i, class_name in enumerate(classes):
 
@@ -491,7 +510,13 @@ print(
     )
 )
 
-print("-" * (24 + 10 * num_classes))
+print(
+    "-" * (
+        24 +
+        10 * num_classes
+    )
+)
+
 
 for i, row in enumerate(cm):
 
@@ -505,20 +530,17 @@ for i, row in enumerate(cm):
 
 
 # ============================================================
-# SANITY CHECK
+# COMPLETE
 # ============================================================
 
 print("\n" + "=" * 70)
-print("EVALUATION COMPLETE")
+print("OLD BASELINE EVALUATION COMPLETE")
 print("=" * 70)
 
 print("\nImportant:")
-print("- Test set was used only for final evaluation.")
+print("- Test set was used only for evaluation.")
 print("- No training was performed.")
 print("- No model selection was performed.")
-print("- Best validation checkpoint was used.")
-print(
-    f"- Best checkpoint: {checkpoint_path}"
-)
-
+print("- Same test set and preprocessing as final evaluation.")
+print(f"- Old checkpoint: {OLD_CHECKPOINT_PATH}")
 print("\n")

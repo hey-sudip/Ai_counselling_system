@@ -1,8 +1,68 @@
-"""EfficientNet-B0 fine-tuning training pipeline."""
+"""
+src/training/train.py
 
-import os
+Facial Emotion Recognition (FER) - Version 2 Baseline Training
+AI Mental Wellness / Counselling System
+
+Model:      EfficientNet-B0 (torchvision, ImageNet pretrained)
+Strategy:   Full fine-tuning (unfreeze_all() - no staged unfreezing yet)
+Optimizer:  AdamW with separate backbone / classifier parameter groups
+Scheduler:  CosineAnnealingLR
+Loss:       CrossEntropyLoss with moderated sqrt inverse-frequency
+class weighting
+
+Configuration is owned entirely by config.yaml via
+src/config_loader.py. This file does not define, override, or
+argparse any hyperparameters - every value below is read from `cfg`.
+
+Validation is delegated to src/training/evaluate.py::evaluate(), which
+is called once per epoch. There is no second validation loop here.
+
+The test set is loaded (by build_dataloaders) but is never referenced
+past the point it's discarded below. It is only used later, standalone,
+after training has finished.
+
+--------------------------------------------------------------------
+Expected config.yaml schema (read by this file):
+--------------------------------------------------------------------
+seed: 42
+
+paths:
+  train_dir: ...
+  val_dir: ...
+  test_dir: ...
+  checkpoint_dir: ...
+
+model:
+  input_size: 224
+  num_classes: 7
+  pretrained: true
+
+training:
+  batch_size: ...
+  num_workers: ...
+  num_epochs: ...
+  early_stopping_patience: ...
+  grad_clip_norm: ...
+  backbone_learning_rate: ...
+  learning_rate: ...          # classifier LR
+  weight_decay: ...
+  device: "cuda" | "cpu" | "auto"
+
+augmentation:
+  horizontal_flip_prob: ...
+  rotation_degrees: ...
+  brightness: ...
+  contrast: ...
+--------------------------------------------------------------------
+"""
+
+import time
 import random
+import logging
+from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
@@ -11,726 +71,467 @@ from tqdm import tqdm
 
 from src.config_loader import load_config
 from src.data.dataset import build_dataloaders
-from src.model.efficientnet_b0 import build_model
-from src.training.evaluate import evaluate
+from src.model.efficientnet_b0 import (
+    build_model,
+    unfreeze_all,
+    count_trainable_parameters,
+)
+from src.training.evaluate import evaluate, print_report
+
+# Console colour support (PowerShell / Windows Terminal friendly).
+# colorama translates ANSI codes for legacy cmd.exe and is a no-op on
+# terminals that already support ANSI, so it's safe cross-platform.
+# Falls back to plain text if colorama isn't installed - purely
+# cosmetic, never a hard dependency for training itself.
+try:
+    from colorama import init as _colorama_init, Fore, Style
+    _colorama_init(autoreset=True)
+except ImportError:
+    class _NoColor:
+        def __getattr__(self, _name):
+            return ""
+    Fore = _NoColor()
+    Style = _NoColor()
 
 
-# =========================================================
-# REPRODUCIBILITY
-# =========================================================
+# --------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("train")
 
-def set_seed(seed=42):
-    """Set random seeds for reproducible training."""
 
+# --------------------------------------------------------------------------
+# Presentation helpers
+# --------------------------------------------------------------------------
+def pct(value: float) -> str:
+    """0.4732 -> '47.32%' - used for end-of-epoch summaries."""
+    return f"{value * 100:.2f}%"
+
+
+def print_rule(char: str = "=", width: int = 78) -> None:
+    print(Fore.BLUE + char * width + Style.RESET_ALL)
+
+
+def print_banner(title: str) -> None:
+    print_rule()
+    print(Fore.CYAN + Style.BRIGHT + title.center(78) + Style.RESET_ALL)
+    print_rule()
+
+
+# --------------------------------------------------------------------------
+# Reproducibility
+# --------------------------------------------------------------------------
+def set_seed(seed: int) -> None:
     random.seed(seed)
-
+    np.random.seed(seed)
     torch.manual_seed(seed)
-
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
+    torch.cuda.manual_seed_all(seed)
+    # Reproducibility over raw speed, as before.
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 
-# =========================================================
-# DEVICE
-# =========================================================
-
-def get_device(cfg):
-    """Select CUDA when requested and available."""
-
-    if (
-        cfg.training.device == "cuda"
-        and torch.cuda.is_available()
-    ):
-        return torch.device("cuda")
-
-    return torch.device("cpu")
-
-
-# =========================================================
-# CLASS WEIGHTS
-# =========================================================
-
-def calculate_class_weights(
-    train_loader,
-    num_classes,
-    device
-):
-    """
-    Calculate moderated class weights.
-
-    Square-root inverse-frequency weighting is used
-    to compensate for class imbalance without allowing
-    the smallest classes to dominate the loss.
-    """
-
-    dataset = train_loader.dataset
-
-    targets = torch.tensor(
-        dataset.targets,
-        dtype=torch.long
-    )
-
-    class_counts = torch.bincount(
-        targets,
-        minlength=num_classes
-    ).float()
-
-    if torch.any(class_counts == 0):
-        raise RuntimeError(
-            "At least one class has zero training samples."
-        )
-
-    total_samples = class_counts.sum()
-
-    inverse_weights = (
-        total_samples
-        / (num_classes * class_counts)
-    )
-
-    class_weights = torch.sqrt(
-        inverse_weights
-    )
-
-    # Normalize weights around 1.0.
-    class_weights = (
-        class_weights
-        / class_weights.mean()
-    )
-
-    class_weights = class_weights.to(device)
-
-    print("\nClass counts:")
-
-    for index, count in enumerate(class_counts):
-        print(
-            f"  Class {index}: "
-            f"{int(count.item())}"
-        )
-
-    print("\nModerated class weights:")
-
-    for index, weight in enumerate(class_weights):
-        print(
-            f"  Class {index}: "
-            f"{weight.item():.4f}"
-        )
-
-    return class_weights
-
-
-# =========================================================
-# OPTIMIZER
-# =========================================================
-
-def create_optimizer(model, cfg):
-    """
-    Create AdamW with separate learning rates.
-
-    Backbone:
-        cfg.training.backbone_learning_rate
-
-    Classification head:
-        cfg.training.learning_rate
-    """
-
-    backbone_parameters = []
-    classifier_parameters = []
-
-    for name, parameter in model.named_parameters():
-
-        if not parameter.requires_grad:
-            continue
-
-        if name.startswith("classifier."):
-            classifier_parameters.append(parameter)
+def get_device(device_setting: str) -> torch.device:
+    if device_setting == "auto":
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            logger.info("Auto-selected GPU: %s", torch.cuda.get_device_name(device))
         else:
-            backbone_parameters.append(parameter)
+            device = torch.device("cpu")
+            logger.info("Auto-selected CPU (CUDA not available).")
+        return device
 
-    if not backbone_parameters:
+    device = torch.device(device_setting)
+    if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
-            "No trainable backbone parameters found."
+            f"config.yaml requests device='{device_setting}' but CUDA is "
+            f"not available on this machine."
+        )
+    if device.type == "cuda":
+        logger.info("Using GPU: %s", torch.cuda.get_device_name(device))
+    else:
+        logger.info("Using CPU.")
+    return device
+
+
+# --------------------------------------------------------------------------
+# Class weighting: moderated square-root inverse frequency
+# --------------------------------------------------------------------------
+def compute_class_weights(train_dataset, num_classes: int) -> tuple:
+    """
+    Moderated square-root inverse-frequency class weighting.
+
+    weight[c] = 1 / sqrt(count[c])
+    weights are then normalized so they sum to num_classes
+    (keeps the effective loss scale comparable to unweighted CE).
+
+    Returns:
+        (weights, counts) - the normalized weight tensor and the raw
+        per-class training sample counts, so callers can log both.
+    """
+    counts = np.zeros(num_classes, dtype=np.float64)
+
+    if hasattr(train_dataset, "targets"):
+        targets = train_dataset.targets
+    elif hasattr(train_dataset, "samples"):
+        targets = [label for _, label in train_dataset.samples]
+    else:
+        raise AttributeError(
+            "train_dataset must expose either `.targets` or `.samples` "
+            "(as produced by torchvision.datasets.ImageFolder) to compute "
+            "class weights."
         )
 
-    if not classifier_parameters:
-        raise RuntimeError(
-            "No trainable classifier parameters found."
+    for label in targets:
+        counts[label] += 1
+
+    if np.any(counts == 0):
+        zero_classes = np.where(counts == 0)[0].tolist()
+        raise ValueError(
+            f"Class(es) {zero_classes} have zero samples in the training "
+            f"set. Cannot compute inverse-frequency weights."
         )
 
-    optimizer = AdamW(
-        [
-            {
-                "params": backbone_parameters,
-                "lr": cfg.training.backbone_learning_rate,
-            },
-            {
-                "params": classifier_parameters,
-                "lr": cfg.training.learning_rate,
-            },
-        ],
-        weight_decay=cfg.training.weight_decay,
-    )
+    inv_sqrt = 1.0 / np.sqrt(counts)
+    weights = inv_sqrt / inv_sqrt.sum() * num_classes
 
-    print("\nOptimizer learning rates:")
+    return torch.tensor(weights, dtype=torch.float32), counts
 
-    print(
-        f"  Backbone    : "
-        f"{cfg.training.backbone_learning_rate:.8f}"
-    )
+# --------------------------------------------------------------------------
+# Optimizer parameter groups (differential LR)
+# --------------------------------------------------------------------------
+def build_optimizer(model: nn.Module, backbone_lr: float, classifier_lr: float,
+                     weight_decay: float) -> AdamW:
+    """
+    Splits parameters into 'classifier' (model.classifier, i.e. the
+    Dropout + Linear head) and 'backbone' (model.features, i.e.
+    everything else) groups so each can use a different learning rate
+    under full fine-tuning.
+    """
+    backbone_params = []
+    classifier_params = []
 
-    print(
-        f"  Classifier  : "
-        f"{cfg.training.learning_rate:.8f}"
-    )
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith("classifier"):
+            classifier_params.append(param)
+        else:
+            backbone_params.append(param)
 
-    print(
-        f"  Weight decay: "
-        f"{cfg.training.weight_decay:.8f}"
-    )
+    if not classifier_params:
+        raise ValueError(
+            "No parameters matched the 'classifier' name prefix. Check "
+            "that build_model() exposes the final head as "
+            "`model.classifier` (torchvision EfficientNet-B0 default)."
+        )
+    if not backbone_params:
+        raise ValueError(
+            "No backbone parameters found with requires_grad=True. "
+            "This run expects full fine-tuning - make sure unfreeze_all() "
+            "was applied."
+        )
 
-    return optimizer
+    param_groups = [
+        {"params": backbone_params, "lr": backbone_lr, "name": "backbone"},
+        {"params": classifier_params, "lr": classifier_lr, "name": "classifier"},
+    ]
+
+    return AdamW(param_groups, weight_decay=weight_decay)
 
 
-# =========================================================
-# ONE TRAINING EPOCH
-# =========================================================
+def get_current_lrs(optimizer: AdamW) -> dict:
+    return {
+        group.get("name", f"group_{i}"): group["lr"]
+        for i, group in enumerate(optimizer.param_groups)
+    }
 
-def train_one_epoch(
-    model,
-    train_loader,
-    criterion,
-    optimizer,
-    device,
-    epoch,
-    total_epochs
-):
-    """Train the model for one epoch."""
 
+# --------------------------------------------------------------------------
+# Train for one epoch (validation lives in evaluate.py, not here)
+# --------------------------------------------------------------------------
+def run_train_epoch(model, dataloader, criterion, optimizer, device,
+                     grad_clip_norm: float, epoch: int, total_epochs: int) -> tuple:
     model.train()
-
     running_loss = 0.0
     correct = 0
     total = 0
 
-    loop = tqdm(
-        train_loader,
-        desc=f"Epoch {epoch}/{total_epochs}"
+    progress = tqdm(
+        dataloader,
+        desc=f"Epoch {epoch}/{total_epochs} [train]",
+        leave=False,
     )
 
-    for images, labels in loop:
+    for images, labels in progress:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
-        images = images.to(
-            device,
-            non_blocking=True
-        )
-
-        labels = labels.to(
-            device,
-            non_blocking=True
-        )
-
-        optimizer.zero_grad(
-            set_to_none=True
-        )
+        optimizer.zero_grad(set_to_none=True)
 
         outputs = model(images)
-
-        loss = criterion(
-            outputs,
-            labels
-        )
-
+        loss = criterion(outputs, labels)
         loss.backward()
 
-        # Prevent unusually large gradients.
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            max_norm=1.0
-        )
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
 
         optimizer.step()
 
         batch_size = images.size(0)
+        running_loss += loss.item() * batch_size
+        preds = outputs.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+        total += batch_size
 
-        running_loss += (
-            loss.item() * batch_size
+        progress.set_postfix(
+            loss=f"{running_loss / total:.4f}",
+            acc=f"{correct / total:.4f}",
         )
 
-        predictions = outputs.argmax(
-            dim=1
-        )
-
-        correct += (
-            predictions == labels
-        ).sum().item()
-
-        total += labels.size(0)
-
-        current_acc = correct / total
-
-        loop.set_postfix(
-            loss=f"{loss.item():.4f}",
-            acc=f"{current_acc:.4f}"
-        )
-
-    train_loss = running_loss / total
-    train_acc = correct / total
-
-    return train_loss, train_acc
+    epoch_loss = running_loss / total
+    epoch_acc = correct / total
+    return epoch_loss, epoch_acc
 
 
-# =========================================================
-# CHECKPOINT
-# =========================================================
-
-def save_checkpoint(
-    path,
-    model,
-    classes,
-    val_acc,
-    val_loss,
-    epoch,
-    best_epoch,
-    class_weights,
-    optimizer,
-    scheduler
-):
-    """Save a complete training checkpoint."""
-
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "classes": classes,
-
-            "val_acc": val_acc,
-            "val_loss": val_loss,
-
-            "epoch": epoch,
-            "best_epoch": best_epoch,
-
-            "stage": "single_stage_finetuning",
-
-            "class_weights": class_weights.cpu(),
-
-            "optimizer_state_dict":
-                optimizer.state_dict(),
-
-            "scheduler_state_dict":
-                scheduler.state_dict(),
-        },
-        path
-    )
+# --------------------------------------------------------------------------
+# Checkpointing
+# --------------------------------------------------------------------------
+def save_checkpoint(path, model, optimizer, scheduler, epoch: int,
+                     best_epoch: int, val_acc: float, val_loss: float,
+                     class_names: list, class_weights: torch.Tensor) -> None:
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "epoch": epoch,
+        "best_epoch": best_epoch,
+        "val_accuracy": val_acc,
+        "val_loss": val_loss,
+        "classes": class_names,
+        "class_weights": class_weights.cpu(),
+        "training_strategy": "full_fine_tuning",
+        "dataset_version": "FER2013_CLEAN_v1",
+    }
+    torch.save(checkpoint, path)
 
 
-# =========================================================
-# MAIN TRAINING FUNCTION
-# =========================================================
-
-def train():
-    """Main EfficientNet-B0 fine-tuning function."""
-
-    # -----------------------------------------------------
-    # CONFIG
-    # -----------------------------------------------------
-
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+def main() -> None:
     cfg = load_config()
 
-    set_seed(42)
+    set_seed(cfg.seed)
+    logger.info("Random seed set to %d", cfg.seed)
 
-    device = get_device(cfg)
+    device = get_device(cfg.training.device)
 
-    print("=" * 70)
-    print("EFFICIENTNET-B0 FINE-TUNING")
-    print("=" * 70)
+    checkpoint_dir = Path(cfg.paths.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    best_ckpt_path = checkpoint_dir / "emotion_model_best.pth"
+    last_ckpt_path = checkpoint_dir / "emotion_model_last.pth"
 
-    print(
-        f"\nUsing device: {device}"
-    )
+    # ----------------------------------------------------------------
+    # Data - dataset.py / transforms.py read cfg.paths, cfg.training,
+    # cfg.model and cfg.augmentation directly, so cfg is passed through
+    # unmodified.
+    # ----------------------------------------------------------------
+    logger.info("Building dataloaders from %s", cfg.paths.train_dir)
+    train_loader, val_loader, test_loader, class_names = build_dataloaders(cfg)
+    # The test loader is intentionally never used past this point.
+    del test_loader
 
-    if device.type == "cuda":
-        print(
-            f"GPU: "
-            f"{torch.cuda.get_device_name(0)}"
-        )
-
-    # -----------------------------------------------------
-    # DATA
-    # -----------------------------------------------------
-
-    print("\n" + "=" * 70)
-    print("LOADING DATASET")
-    print("=" * 70)
-
-    (
-        train_loader,
-        val_loader,
-        _,
-        classes
-    ) = build_dataloaders(cfg)
-
-    print(
-        f"\nClasses: {classes}"
-    )
-
-    num_classes = len(classes)
-
+    num_classes = len(class_names)
     if num_classes != cfg.model.num_classes:
-        raise RuntimeError(
-            f"Class mismatch: "
-            f"dataset has {num_classes} classes, "
-            f"config expects {cfg.model.num_classes}."
+        logger.warning(
+            "Number of classes found in dataset (%d) does not match "
+            "cfg.model.num_classes (%d). The model head will use "
+            "cfg.model.num_classes as configured - update config.yaml "
+            "if this is unintended.",
+            num_classes, cfg.model.num_classes,
         )
+    logger.info("Classes (%d): %s", num_classes, class_names)
 
-    print(
-        f"Training batches   : "
-        f"{len(train_loader)}"
+    # ----------------------------------------------------------------
+    # Model - full fine-tuning, nothing frozen. Staged fine-tuning
+    # helpers exist in efficientnet_b0.py but are not used yet.
+    # ----------------------------------------------------------------
+    model = build_model(cfg)
+    unfreeze_all(model)
+    model.to(device)
+
+    trainable_params = count_trainable_parameters(model)
+    total_params = sum(p.numel() for p in model.parameters())
+    logger.info(
+        "Parameters - total: %s | trainable: %s (full fine-tuning)",
+        f"{total_params:,}", f"{trainable_params:,}",
     )
 
-    print(
-        f"Validation batches : "
-        f"{len(val_loader)}"
+    # ----------------------------------------------------------------
+    # Class weights (moderated sqrt inverse frequency)
+    # ----------------------------------------------------------------
+    class_weights, class_counts = compute_class_weights(train_loader.dataset, num_classes)
+    class_weights = class_weights.to(device)
+    logger.info(
+        "Training class distribution: %s",
+        {name: int(c) for name, c in zip(class_names, class_counts)},
     )
-
-    print(
-        "\n✓ Test loader was created "
-        "but will NOT be used during training."
-    )
-
-    # -----------------------------------------------------
-    # MODEL
-    # -----------------------------------------------------
-
-    print("\n" + "=" * 70)
-    print("BUILDING MODEL")
-    print("=" * 70)
-
-    model = build_model(cfg).to(device)
-
-    print(
-        f"\nModel: {cfg.model.name}"
-    )
-
-    print(
-        f"Pretrained: "
-        f"{cfg.model.pretrained}"
-    )
-
-    print(
-        f"Input size: "
-        f"{cfg.model.input_size}x"
-        f"{cfg.model.input_size}"
-    )
-
-    print(
-        f"Number of classes: "
-        f"{num_classes}"
-    )
-
-    # -----------------------------------------------------
-    # CLASS WEIGHTS
-    # -----------------------------------------------------
-
-    class_weights = calculate_class_weights(
-        train_loader,
-        num_classes,
-        device
+    logger.info(
+        "Class weights (sqrt inverse-frequency): %s",
+        {name: round(w, 4) for name, w in zip(class_names, class_weights.tolist())},
     )
 
     criterion = nn.CrossEntropyLoss(
-        weight=class_weights
+        weight=class_weights,
+        label_smoothing=0.1
     )
-
-    # -----------------------------------------------------
-    # OPTIMIZER
-    # -----------------------------------------------------
-
-    optimizer = create_optimizer(
+    # ----------------------------------------------------------------
+    # Optimizer + scheduler - every value from cfg.training
+    # ----------------------------------------------------------------
+    optimizer = build_optimizer(
         model,
-        cfg
+        backbone_lr=cfg.training.backbone_learning_rate,
+        classifier_lr=cfg.training.learning_rate,
+        weight_decay=cfg.training.weight_decay,
     )
-
-    # -----------------------------------------------------
-    # SCHEDULER
-    # -----------------------------------------------------
-
+    # No scheduler section in config.yaml - CosineAnnealingLR's default
+    # eta_min=0 is used as-is rather than introducing a new config key.
     scheduler = CosineAnnealingLR(
         optimizer,
-        T_max=cfg.training.num_epochs,
-        eta_min=1e-6
+        T_max=cfg.training.num_epochs * 2
     )
-
-    # -----------------------------------------------------
-    # CHECKPOINT DIRECTORY
-    # -----------------------------------------------------
-
-    os.makedirs(
-        cfg.paths.checkpoint_dir,
-        exist_ok=True
-    )
-
-    # IMPORTANT:
-    # This training run starts fresh.
-    #
-    # The previous 63.18% model should already have
-    # been backed up separately.
-    #
-    # Example:
-    # emotion_model_finetuned_63_18.pth
-
-    best_path = os.path.join(
-        cfg.paths.checkpoint_dir,
-        "emotion_model_finetuned.pth"
-    )
-
-    last_path = os.path.join(
-        cfg.paths.checkpoint_dir,
-        "emotion_model_finetuned_last.pth"
-    )
-
-    # -----------------------------------------------------
-    # TRAINING STATE
-    # -----------------------------------------------------
 
     best_val_acc = 0.0
     best_epoch = 0
-
     epochs_without_improvement = 0
 
-    patience = (
-        cfg.training.early_stopping_patience
-    )
-
-    # -----------------------------------------------------
-    # TRAINING
-    # -----------------------------------------------------
-
-    print("\n" + "=" * 70)
-
+    # ----------------------------------------------------------------
+    # Training loop
+    # ----------------------------------------------------------------
+    print_banner("TRAINING START - FER V2 Baseline (full fine-tuning)")
     print(
-        f"TRAINING FOR "
-        f"{cfg.training.num_epochs} EPOCHS"
+        f"{Fore.WHITE}Epochs: {cfg.training.num_epochs}  |  "
+        f"Patience: {cfg.training.early_stopping_patience}  |  "
+        f"Device: {device}{Style.RESET_ALL}\n"
     )
+    training_start = time.time()
 
-    print("=" * 70)
+    for epoch in range(1, cfg.training.num_epochs + 1):
+        epoch_start = time.time()
 
-    print(
-        f"\nEarly stopping patience: "
-        f"{patience}"
-    )
-
-    print(
-        "\nTraining mode: FRESH RUN"
-    )
-
-    print(
-        "Previous checkpoint will NOT "
-        "be loaded."
-    )
-
-    for epoch in range(
-        1,
-        cfg.training.num_epochs + 1
-    ):
-
-        # -------------------------------------------------
-        # TRAIN
-        # -------------------------------------------------
-
-        train_loss, train_acc = train_one_epoch(
-            model=model,
-            train_loader=train_loader,
-            criterion=criterion,
-            optimizer=optimizer,
-            device=device,
-            epoch=epoch,
-            total_epochs=cfg.training.num_epochs
+        train_loss, train_acc = run_train_epoch(
+            model, train_loader, criterion, optimizer, device,
+            grad_clip_norm=cfg.training.grad_clip_norm,
+            epoch=epoch, total_epochs=cfg.training.num_epochs,
         )
 
-        # -------------------------------------------------
-        # VALIDATION
-        # -------------------------------------------------
-
-        val_loss, val_acc, _, _, _, _, _, _, _, _ = evaluate(
-            model,
-            val_loader,
-            criterion,
-            device
-        )
-
-        current_backbone_lr = (
-            optimizer.param_groups[0]["lr"]
-        )
-
-        current_classifier_lr = (
-            optimizer.param_groups[1]["lr"]
-        )
-
-        print(
-            f"\nEpoch {epoch}: "
-            f"train_loss={train_loss:.4f} "
-            f"train_acc={train_acc:.4f} "
-            f"val_loss={val_loss:.4f} "
-            f"val_acc={val_acc:.4f}"
-        )
-
-        print(
-            f"Learning rates: "
-            f"backbone={current_backbone_lr:.8f} "
-            f"classifier={current_classifier_lr:.8f}"
-        )
-
-        # -------------------------------------------------
-        # BEST MODEL
-        # -------------------------------------------------
-
-        if val_acc > best_val_acc:
-
-            best_val_acc = val_acc
-            best_epoch = epoch
-
-            epochs_without_improvement = 0
-
-            save_checkpoint(
-                path=best_path,
-                model=model,
-                classes=classes,
-                val_acc=val_acc,
-                val_loss=val_loss,
-                epoch=epoch,
-                best_epoch=best_epoch,
-                class_weights=class_weights,
-                optimizer=optimizer,
-                scheduler=scheduler
-            )
-
-            print(
-                "\n✓ New best model saved!"
-            )
-
-            print(
-                f"  Validation accuracy: "
-                f"{val_acc * 100:.2f}%"
-            )
-
-        else:
-
-            epochs_without_improvement += 1
-
-            print(
-                f"\nNo validation improvement "
-                f"for "
-                f"{epochs_without_improvement} "
-                f"epoch(s)."
-            )
-
-        # -------------------------------------------------
-        # SCHEDULER
-        # -------------------------------------------------
+        # Validation is fully delegated to evaluate.py - no second
+        # validation loop lives in this file.
+        (
+            val_loss,
+            val_acc,
+            macro_precision,
+            macro_recall,
+            macro_f1,
+            cm,
+            per_class_precision,
+            per_class_recall,
+            per_class_f1,
+            per_class_support,
+        ) = evaluate(model, val_loader, criterion, device)
 
         scheduler.step()
 
-        # -------------------------------------------------
-        # EARLY STOPPING
-        # -------------------------------------------------
+        current_lrs = get_current_lrs(optimizer)
+        epoch_time = time.time() - epoch_start
+        is_best = val_acc > best_val_acc
 
-        if (
-            epochs_without_improvement
-            >= patience
-        ):
+        # End-of-epoch summary: percentages here (readable at a glance),
+        # while the tqdm bar above still shows live decimals per batch.
+        val_color = Fore.GREEN if is_best else Fore.YELLOW
+        print_rule("-")
+        print(
+            f"{Fore.CYAN}{Style.BRIGHT}Epoch {epoch:>3}/{cfg.training.num_epochs}"
+            f"{Style.RESET_ALL}  ({epoch_time:.1f}s)"
+        )
+        print(
+            f"  train  -> loss: {train_loss:.4f}   acc: {pct(train_acc)}"
+        )
+        print(
+            f"  val    -> loss: {val_loss:.4f}   "
+            f"acc: {val_color}{pct(val_acc)}{Style.RESET_ALL}   "
+            f"macro_f1: {pct(macro_f1)}"
+        )
+        print(
+            f"  lr     -> backbone: {current_lrs.get('backbone', float('nan')):.2e}"
+            f"   classifier: {current_lrs.get('classifier', float('nan')):.2e}"
+        )
 
+        # Always save "last" checkpoint
+        save_checkpoint(
+            last_ckpt_path, model, optimizer, scheduler, epoch,
+            best_epoch, val_acc, val_loss, class_names, class_weights,
+        )
+
+        # Save "best" checkpoint + early stopping bookkeeping
+        if is_best:
+            best_val_acc = val_acc
+            best_epoch = epoch
+            epochs_without_improvement = 0
+            save_checkpoint(
+                best_ckpt_path, model, optimizer, scheduler, epoch,
+                best_epoch, val_acc, val_loss, class_names, class_weights,
+            )
             print(
-                "\n" + "=" * 70
+                f"  {Fore.GREEN}{Style.BRIGHT}\u2713 New best model "
+                f"(val_acc: {pct(val_acc)}) -> {best_ckpt_path.name}"
+                f"{Style.RESET_ALL}"
+            )
+        else:
+            epochs_without_improvement += 1
+            print(
+                f"  {Fore.YELLOW}No improvement: "
+                f"{epochs_without_improvement}/{cfg.training.early_stopping_patience}"
+                f"  (best: {pct(best_val_acc)} @ epoch {best_epoch})"
+                f"{Style.RESET_ALL}"
             )
 
+        if epochs_without_improvement >= cfg.training.early_stopping_patience:
+            print_rule("-")
             print(
-                "EARLY STOPPING"
+                f"{Fore.RED}{Style.BRIGHT}Early stopping triggered at epoch "
+                f"{epoch} (no improvement for "
+                f"{cfg.training.early_stopping_patience} epochs).{Style.RESET_ALL}"
             )
-
-            print(
-                "=" * 70
-            )
-
-            print(
-                f"\nNo validation improvement "
-                f"for {patience} epochs."
-            )
-
             break
 
-    # -----------------------------------------------------
-    # SAVE LAST MODEL
-    # -----------------------------------------------------
-
-    save_checkpoint(
-        path=last_path,
-        model=model,
-        classes=classes,
-        val_acc=val_acc,
-        val_loss=val_loss,
-        epoch=epoch,
-        best_epoch=best_epoch,
-        class_weights=class_weights,
-        optimizer=optimizer,
-        scheduler=scheduler
-    )
-
-    # -----------------------------------------------------
-    # FINAL SUMMARY
-    # -----------------------------------------------------
-
-    print("\n" + "=" * 70)
-    print("TRAINING COMPLETE")
-    print("=" * 70)
-
+    total_time = time.time() - training_start
+    print_banner("TRAINING COMPLETE")
     print(
-        f"\nBest validation accuracy: "
-        f"{best_val_acc:.4f}"
+        f"  Duration     : {total_time / 60.0:.1f} min\n"
+        f"  {Fore.GREEN}Best val acc : {pct(best_val_acc)} (epoch {best_epoch}){Style.RESET_ALL}\n"
+        f"  Best model   : {best_ckpt_path}\n"
+        f"  Last model   : {last_ckpt_path}\n"
     )
 
-    print(
-        f"Best validation accuracy: "
-        f"{best_val_acc * 100:.2f}%"
+    # Final validation-set report from the last epoch run, using the
+    # existing evaluate.py reporting utility (still not the test set).
+    print_report(
+        per_class_precision, per_class_recall, per_class_f1, cm,
+        class_names, support=per_class_support,
     )
 
-    print(
-        f"Best epoch: "
-        f"{best_epoch}"
+    logger.info(
+        "Reminder: the test set was NOT used during training. "
+        "Run src/training/evaluate.py against %s for final metrics.",
+        best_ckpt_path,
     )
 
-    print(
-        f"\nBest model saved to:"
-    )
-
-    print(best_path)
-
-    print(
-        f"\nLast model saved to:"
-    )
-
-    print(last_path)
-
-    print(
-        "\n✓ Test set was not used "
-        "for model selection."
-    )
-
-    print(
-        "✓ Best checkpoint is selected "
-        "using validation accuracy."
-    )
-
-    print(
-        "\n✓ Training completed using "
-        "EfficientNet-B0."
-    )
-
-
-# =========================================================
-# ENTRY POINT
-# =========================================================
 
 if __name__ == "__main__":
-    train()
+    main()
